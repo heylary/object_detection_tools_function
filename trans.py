@@ -1,63 +1,69 @@
 import json
-import os
-from pathlib import Path
 
-import requests
-import yaml
+import cv2
+import pandas as pd
 from PIL import Image
-from tqdm import tqdm
 
-from utils import make_dirs
+from utils import *
 
+def convert_coco_json(json_dir='../coco/annotations/', use_segments=False, cls91to80=False):
+    save_dir = make_dirs()  # output directory
+    coco80 = coco91_to_coco80_class()
 
-def convert(file, zip=True):
-    # Convert Labelbox JSON labels to YOLO labels
-    names = []  # class names
-    file = Path(file)
-    save_dir = make_dirs(file.stem)
-    with open(file) as f:
-        data = json.load(f)  # load JSON
+    # Import json
+    for json_file in sorted(Path(json_dir).resolve().glob('*.json')):
+        fn = Path(save_dir) / 'labels' / json_file.stem.replace('instances_', '')  # folder name
+        fn.mkdir()
+        with open(json_file) as f:
+            data = json.load(f)
 
-    for img in tqdm(data, desc=f'Converting {file}'):
-        im_path = img['Labeled Data']
-        im = Image.open(requests.get(im_path, stream=True).raw if im_path.startswith('http') else im_path)  # open
-        width, height = im.size  # image size
-        label_path = save_dir / 'labels' / Path(img['External ID']).with_suffix('.txt').name
-        image_path = save_dir / 'images' / img['External ID']
-        im.save(image_path, quality=95, subsampling=0)
+        # Create image dict
+        images = {'%g' % x['id']: x for x in data['images']}
 
-        for label in img['Label']['objects']:
-            # box
-            top, left, h, w = label['bbox'].values()  # top, left, height, width
-            xywh = [(left + w / 2) / width, (top + h / 2) / height, w / width, h / height]  # xywh normalized
+        # Write labels file
+        for x in tqdm(data['annotations'], desc=f'Annotations {json_file}'):
+            if x['iscrowd']:
+                continue
 
-            # class
-            cls = label['value']  # class name
-            if cls not in names:
-                names.append(cls)
+            img = images['%g' % x['image_id']]
+            h, w, f = img['height'], img['width'], img['file_name']
 
-            line = names.index(cls), *xywh  # YOLO format (class_index, xywh)
-            with open(label_path, 'a') as f:
-                f.write(('%g ' * len(line)).rstrip() % line + '\n')
+            # The COCO box format is [top left x, top left y, width, height]
+            box = np.array(x['bbox'], dtype=np.float64)
+            box[:2] += box[2:] / 2  # xy top-left corner to center
+            box[[0, 2]] /= w  # normalize x
+            box[[1, 3]] /= h  # normalize y
 
-    # Save dataset.yaml
-    d = {'path': f"../datasets/{file.stem}  # dataset root dir",
-         'train': "images/train  # train images (relative to path) 128 images",
-         'val': "images/val  # val images (relative to path) 128 images",
-         'test': " # test images (optional)",
-         'nc': len(names),
-         'names': names}  # dictionary
+            keypoint = np.array(x['keypoints'], dtype=np.float64)
+            keypoint[::3]  /= w
+            keypoint[1::3]  /= h
 
-    with open(save_dir / file.with_suffix('.yaml').name, 'w') as f:
-        yaml.dump(d, f, sort_keys=False)
+            # Write
+            if box[2] > 0 and box[3] > 0:  # if w > 0 and h > 0
+                cls = coco80[x['category_id'] - 1] if cls91to80 else x['category_id'] - 1  # class
+                line = cls, *box, *keypoint  # cls, box or segments
+                with open((fn / f).with_suffix('.txt'), 'a') as file:
+                    file.write(('%g ' * len(line)).rstrip() % line + '\n')
 
-    # Zip
-    if zip:
-        print(f'Zipping as {save_dir}.zip...')
-        os.system(f'zip -qr {save_dir}.zip {save_dir}')
-
-    print('Conversion completed successfully!')
-
+def min_index(arr1, arr2):
+    """Find a pair of indexes with the shortest distance. 
+    Args:
+        arr1: (N, 2).
+        arr2: (M, 2).
+    Return:
+        a pair of indexes(tuple).
+    """
+    # (N, M)
+    dis = ((arr1[:, None, :] - arr2[None, :, :]) ** 2).sum(-1)
+    index = np.unravel_index(np.argmin(dis, axis=None), dis.shape)
+    return index
 
 if __name__ == '__main__':
-    convert('coco/person_keypoints_val2017.json')
+    source = 'COCO'
+
+    if source == 'COCO':
+        convert_coco_json('./coco/')  # directory with *.json
+
+
+    # zip results
+    # os.system('zip -r ../coco.zip ../coco')
